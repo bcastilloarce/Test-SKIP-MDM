@@ -1,173 +1,227 @@
 #!/bin/bash
 
-# Global constants
+# Constantes globales
 readonly DEFAULT_SYSTEM_VOLUME="Macintosh HD"
 readonly DEFAULT_DATA_VOLUME="Macintosh HD - Data"
+readonly DSCL_PATH="/private/var/db/dslocal/nodes/Default"
+readonly LOCAL_USERS_PATH="/Local/Default/Users"
+readonly DEFAULT_UID="501"
+readonly HOSTS_FILE="/etc/hosts"
+readonly CONFIG_PROFILES_PATH="/var/db/ConfigurationProfiles/Settings"
 
-# Text formating
-RED='\033[1;31m'
-GREEN='\033[1;32m'
-BLUE='\033[1;34m'
-YELLOW='\033[1;33m'
-CYAN='\033[1;36m'
-NC='\033[0m'
+# Colores para formato de texto
+readonly RED='\033[1;31m'
+readonly GREEN='\033[1;32m'
+readonly BLUE='\033[1;34m'
+readonly CYAN='\033[1;36m'
+readonly NC='\033[0m'
 
-# Checks if a volume with the given name exists
-checkVolumeExistence() {
-	local volumeLabel="$*"
-	diskutil info "$volumeLabel" >/dev/null 2>&1
+# Función para imprimir mensajes con color
+print_colored() {
+    local color="$1"
+    local message="$2"
+    echo -e "${color}${message}${NC}"
 }
 
-# Returns the name of a volume with the given type
-getVolumeName() {
-	local volumeType="$1"
-
-	# Getting the APFS Container Disk Identifier
-	apfsContainer=$(diskutil list internal physical | grep 'Container' | awk -F'Container ' '{print $2}' | awk '{print $1}')
-	# Getting the Volume Information
-	volumeInfo=$(diskutil ap list "$apfsContainer" | grep -A 5 "($volumeType)")
-	# Extracting the Volume Name from the Volume Information
-	volumeNameLine=$(echo "$volumeInfo" | grep 'Name:')
-	# Removing unnecessary characters to get the clean Volume Name
-	volumeName=$(echo "$volumeNameLine" | cut -d':' -f2 | cut -d'(' -f1 | xargs)
-
-	echo "$volumeName"
+# Función para verificar la existencia de un volumen
+check_volume_existence() {
+    local volume_label="$1"
+    diskutil info "$volume_label" &>/dev/null
 }
 
-# Defines the path to a volume with the given default name and volume type
-defineVolumePath() {
-	local defaultVolume=$1
-	local volumeType=$2
+# Función para obtener el nombre de un volumen por tipo
+get_volume_name() {
+    local volume_type="$1"
+    local apfs_container
+    local volume_info
+    local volume_name
 
-	if checkVolumeExistence "$defaultVolume"; then
-		echo "/Volumes/$defaultVolume"
-	else
-		local volumeName
-		volumeName="$(getVolumeName "$volumeType")"
-		echo "/Volumes/$volumeName"
-	fi
+    apfs_container=$(diskutil list internal physical | grep 'Container' | awk -F'Container ' '{print $2}' | awk '{print $1}')
+    volume_info=$(diskutil ap list "$apfs_container" | grep -A 5 "($volume_type)")
+    volume_name=$(echo "$volume_info" | grep 'Name:' | cut -d':' -f2 | cut -d'(' -f1 | xargs)
+
+    echo "$volume_name"
 }
 
-# Mounts a volume at the given path
-mountVolume() {
-	local volumePath=$1
+# Función para definir la ruta a un volumen
+define_volume_path() {
+    local default_volume="$1"
+    local volume_type="$2"
 
-	if [ ! -d "$volumePath" ]; then
-		diskutil mount "$volumePath"
-	fi
+    if check_volume_existence "$default_volume"; then
+        echo "/Volumes/$default_volume"
+    else
+        local volume_name
+        volume_name="$(get_volume_name "$volume_type")"
+        echo "/Volumes/$volume_name"
+    fi
 }
 
-echo -e "${CYAN}*-------------------*---------------------*${NC}"
-echo -e "${YELLOW}* Check MDM - Skip MDM Auto for MacOS by  *${NC}"
-echo -e "${RED}*             SKIPMDM.COM                 *${NC}"
-echo -e "${RED}*            Phoenix Team                 *${NC}"
-echo -e "${CYAN}*-------------------*---------------------*${NC}"
-echo ""
+# Función para montar un volumen
+mount_volume() {
+    local volume_path="$1"
 
-PS3='Please enter your choice: '
-options=("Autoypass on Recovery" "Check MDM Enrollment" "Reboot" "Exit")
+    if [ ! -d "$volume_path" ]; then
+        diskutil mount "$volume_path" || {
+            print_colored "$RED" "Error: No se pudo montar $volume_path"
+            exit 1
+        }
+    fi
+}
 
-select opt in "${options[@]}"; do
-	case $opt in
-	"Autoypass on Recovery")
-		echo -e "\n\t${GREEN}Bypass on Recovery${NC}\n"
+# Función para crear un nuevo usuario
+create_user() {
+    local dscl_path="$1"
+    local username="$2"
+    local full_name="$3"
+    local password="$4"
 
-		# Mount Volumes
-		echo -e "${BLUE}Mounting volumes...${NC}"
-		# Mount System Volume
-		systemVolumePath=$(defineVolumePath "$DEFAULT_SYSTEM_VOLUME" "System")
-		mountVolume "$systemVolumePath"
+    dscl -f "$dscl_path" localhost -create "$LOCAL_USERS_PATH/$username" || return 1
+    dscl -f "$dscl_path" localhost -create "$LOCAL_USERS_PATH/$username" UserShell "/bin/zsh" || return 1
+    dscl -f "$dscl_path" localhost -create "$LOCAL_USERS_PATH/$username" RealName "$full_name" || return 1
+    dscl -f "$dscl_path" localhost -create "$LOCAL_USERS_PATH/$username" UniqueID "$DEFAULT_UID" || return 1
+    dscl -f "$dscl_path" localhost -create "$LOCAL_USERS_PATH/$username" PrimaryGroupID "20" || return 1
+    mkdir -p "$data_volume_path/Users/$username" || return 1
+    dscl -f "$dscl_path" localhost -create "$LOCAL_USERS_PATH/$username" NFSHomeDirectory "/Users/$username" || return 1
+    dscl -f "$dscl_path" localhost -passwd "$LOCAL_USERS_PATH/$username" "$password" || return 1
+    dscl -f "$dscl_path" localhost -append "/Local/Default/Groups/admin" GroupMembership "$username" || return 1
+    return 0
+}
 
-		# Mount Data Volume
-		dataVolumePath=$(defineVolumePath "$DEFAULT_DATA_VOLUME" "Data")
-		mountVolume "$dataVolumePath"
+# Función para bloquear hosts MDM
+block_mdm_hosts() {
+    local hosts_file="$1"
+    local blocked_domains=(
+        "deviceenrollment.apple.com"
+        "mdmenrollment.apple.com"
+        "iprofiles.apple.com"
+        "gdmf.apple.com"
+        "acmdm.apple.com"
+        "albert.apple.com"
+    )
 
-		echo -e "${GREEN}Volume preparation completed${NC}\n"
+    for domain in "${blocked_domains[@]}"; do
+        echo "0.0.0.0 $domain" >> "$hosts_file" || {
+            print_colored "$RED" "Error: No se pudo agregar $domain a $hosts_file"
+            return 1
+        }
+    done
+    return 0
+}
 
-		# Create User
-		echo -e "${BLUE}Checking user existence${NC}"
-		dscl_path="$dataVolumePath/private/var/db/dslocal/nodes/Default"
-		localUserDirPath="/Local/Default/Users"
-		defaultUID="501"
-		if ! dscl -f "$dscl_path" localhost -list "$localUserDirPath" UniqueID | grep -q "\<$defaultUID\>"; then
-			echo -e "${CYAN}Create a new user / Tạo User mới${NC}"
-			echo -e "${CYAN}Press Enter to continue, Note: Leaving it blank will default to the automatic user / Nhấn Enter để tiếp tục, Lưu ý: có thể không điền sẽ tự động nhận User mặc định${NC}"
-			echo -e "${CYAN}Enter Full Name (Default: Apple) / Nhập tên User (Mặc định: Apple)${NC}"
-			read -rp "Full name: " fullName
-			fullName="${fullName:=Apple}"
+# Función para remover perfiles de configuración
+remove_config_profiles() {
+    local config_profiles_path="$1"
+    local data_volume_path="$2"
 
-			echo -e "${CYAN}Nhận Username${NC} ${RED}WRITE WITHOUT SPACES / VIẾT LIỀN KHÔNG DẤU${NC} ${GREEN}(Mặc định: Apple)${NC}"
-			read -rp "Username: " username
-			username="${username:=Apple}"
+    touch "$data_volume_path/private/var/db/.AppleSetupDone" || return 1
+    rm -rf "$config_profiles_path/.cloudConfigHasActivationRecord" || return 1
+    rm -rf "$config_profiles_path/.cloudConfigRecordFound" || return 1
+    touch "$config_profiles_path/.cloudConfigProfileInstalled" || return 1
+    touch "$config_profiles_path/.cloudConfigRecordNotFound" || return 1
+    return 0
+}
 
-			echo -e "${CYAN}Enter the User Password (default: 4 space) / Nhập mật khẩu (mặc định: 4 dấu cách)${NC}"
-			read -rsp "Password: " userPassword
-			userPassword="${userPassword:=.   }"
+# Función principal de bypass MDM
+bypass_mdm() {
+    print_colored "$BLUE" "Montando volúmenes..."
 
-			echo -e "\n${BLUE}Creating User / Đang tạo User${NC}"
-			dscl -f "$dscl_path" localhost -create "$localUserDirPath/$username"
-			dscl -f "$dscl_path" localhost -create "$localUserDirPath/$username" UserShell "/bin/zsh"
-			dscl -f "$dscl_path" localhost -create "$localUserDirPath/$username" RealName "$fullName"
-			dscl -f "$dscl_path" localhost -create "$localUserDirPath/$username" UniqueID "$defaultUID"
-			dscl -f "$dscl_path" localhost -create "$localUserDirPath/$username" PrimaryGroupID "20"
-			mkdir "$dataVolumePath/Users/$username"
-			dscl -f "$dscl_path" localhost -create "$localUserDirPath/$username" NFSHomeDirectory "/Users/$username"
-			dscl -f "$dscl_path" localhost -passwd "$localUserDirPath/$username" "$userPassword"
-			dscl -f "$dscl_path" localhost -append "/Local/Default/Groups/admin" GroupMembership "$username"
-			echo -e "${GREEN}User created${NC}\n"
-		else
-			echo -e "${BLUE}User already created${NC}\n"
-		fi
+    local system_volume_path
+    local data_volume_path
+    system_volume_path=$(define_volume_path "$DEFAULT_SYSTEM_VOLUME" "System")
+    data_volume_path=$(define_volume_path "$DEFAULT_DATA_VOLUME" "Data")
 
-		# Block MDM hosts
-		echo -e "${BLUE}Blocking MDM hosts...${NC}"
-		hostsPath="$systemVolumePath/etc/hosts"
-		blockedDomains=("deviceenrollment.apple.com" "mdmenrollment.apple.com" "iprofiles.apple.com" "gdmf.apple.com" "acmdm.apple.com" "albert.apple.com")
-		for domain in "${blockedDomains[@]}"; do
-			echo "0.0.0.0 $domain" >>"$hostsPath"
-		done
-		echo -e "${GREEN}Successfully blocked host / Thành công chặn host${NC}\n"
+    mount_volume "$system_volume_path"
+    mount_volume "$data_volume_path"
 
-		# Remove config profiles
-		echo -e "${BLUE}Remove config profiles${NC}"
-		configProfilesSettingsPath="$systemVolumePath/var/db/ConfigurationProfiles/Settings"
-		touch "$dataVolumePath/private/var/db/.AppleSetupDone"
-		rm -rf "$configProfilesSettingsPath/.cloudConfigHasActivationRecord"
-		rm -rf "$configProfilesSettingsPath/.cloudConfigRecordFound"
-		touch "$configProfilesSettingsPath/.cloudConfigProfileInstalled"
-		touch "$configProfilesSettingsPath/.cloudConfigRecordNotFound"
-		echo -e "${GREEN}Config profiles removed${NC}\n"
+    print_colored "$GREEN" "Preparación de volúmenes completada"
 
-		echo -e "${GREEN}------ Autobypass SUCCESSFULLY / Autobypass HOÀN TẤT ------${NC}"
-		echo -e "${CYAN}------ Exit Terminal. Reboot Macbook and ENJOY ! ------${NC}"
-		break
-		;;
+    print_colored "$BLUE" "Verificando existencia de usuario"
+    local dscl_path="$data_volume_path$DSCL_PATH"
+    if ! dscl -f "$dscl_path" localhost -list "$LOCAL_USERS_PATH" UniqueID | grep -q "\<$DEFAULT_UID\>"; then
+        print_colored "$CYAN" "Creando nuevo usuario"
+        read -rp "Nombre completo (Predeterminado: Apple): " full_name
+        full_name="${full_name:-Apple}"
 
-	"Check MDM Enrollment")
-		if [ ! -f /usr/bin/profiles ]; then
-			echo -e "\n\t${RED}Don't use this option in recovery${NC}\n"
-			continue
-		fi
+        read -rp "Nombre de usuario (Predeterminado: Apple): " username
+        username="${username:-Apple}"
 
-		if ! sudo profiles show -type enrollment >/dev/null 2>&1; then
-			echo -e "\n\t${GREEN}Success${NC}\n"
-		else
-			echo -e "\n\t${RED}Failure${NC}\n"
-		fi
-		;;
+        read -rsp "Contraseña (Predeterminado: 4 espacios): " password
+        echo
+        password="${password:-.   }"
 
-	"Reboot")
-		echo -e "\n\t${BLUE}Rebooting...${NC}\n"
-		reboot
-		;;
+        if create_user "$dscl_path" "$username" "$full_name" "$password"; then
+            print_colored "$GREEN" "Usuario creado exitosamente"
+        else
+            print_colored "$RED" "Error: No se pudo crear el usuario"
+            exit 1
+        fi
+    else
+        print_colored "$BLUE" "Usuario ya existente"
+    fi
 
-	"Exit")
-		echo -e "\n\t${BLUE}Exiting...${NC}\n"
-		exit
-		;;
+    print_colored "$BLUE" "Bloqueando hosts MDM..."
+    if block_mdm_hosts "$system_volume_path$HOSTS_FILE"; then
+        print_colored "$GREEN" "Hosts bloqueados exitosamente"
+    else
+        print_colored "$RED" "Error: No se pudieron bloquear todos los hosts MDM"
+        exit 1
+    fi
 
-	*)
-		echo "Invalid option $REPLY"
-		;;
-	esac
-done
+    print_colored "$BLUE" "Removiendo perfiles de configuración"
+    if remove_config_profiles "$system_volume_path$CONFIG_PROFILES_PATH" "$data_volume_path"; then
+        print_colored "$GREEN" "Perfiles de configuración removidos exitosamente"
+    else
+        print_colored "$RED" "Error: No se pudieron remover todos los perfiles de configuración"
+        exit 1
+    fi
+
+    print_colored "$GREEN" "------ Bypass automático COMPLETADO ------"
+    print_colored "$CYAN" "------ Salga del Terminal. Reinicie el MacBook y DISFRUTE! ------"
+}
+
+# Función para verificar la inscripción MDM
+check_mdm_enrollment() {
+    if [ ! -f /usr/bin/profiles ]; then
+        print_colored "$RED" "No use esta opción en recovery"
+        return
+    fi
+
+    if ! sudo profiles show -type enrollment &>/dev/null; then
+        print_colored "$GREEN" "Éxito: No se detectó inscripción MDM"
+    else
+        print_colored "$RED" "Fallo: Se detectó inscripción MDM activa"
+    fi
+}
+
+# Menú principal
+main_menu() {
+    local PS3='Por favor, ingrese su elección: '
+    local options=("Bypass automático en Recovery" "Verificar inscripción MDM" "Reiniciar" "Salir")
+
+    select opt in "${options[@]}"; do
+        case $opt in
+            "Bypass automático en Recovery")
+                bypass_mdm
+                break
+                ;;
+            "Verificar inscripción MDM")
+                check_mdm_enrollment
+                ;;
+            "Reiniciar")
+                print_colored "$BLUE" "Reiniciando..."
+                reboot
+                ;;
+            "Salir")
+                print_colored "$BLUE" "Saliendo..."
+                exit 0
+                ;;
+            *)
+                print_colored "$RED" "Opción inválida $REPLY"
+                ;;
+        esac
+    done
+}
+
+# Ejecutar el menú principal
+main_menu
