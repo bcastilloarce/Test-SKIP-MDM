@@ -1,9 +1,11 @@
+# Skip MDM (test)
+
 ## Usage
 
 To use this script, follow these steps:
 
 1. Copy the following command:
-   
+
    ```bash
    curl https://raw.githubusercontent.com/bcastilloarce/Test-SKIP-MDM/main/MDMTest.sh -o test.sh && chmod +x ./test.sh && ./test.sh
 
